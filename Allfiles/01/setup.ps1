@@ -1,138 +1,57 @@
-Clear-Host
+param(
+    [Parameter(Mandatory=$true)]
+    [string]
+    $SubscriptionId,
+    [Parameter(Mandatory=$true)]
+    [string]
+    $ResourceGroupName,
+    [Parameter(Mandatory=$true)]
+    [string]
+    $SqlPassword
+)
+
+$ErrorActionPreference = 'Stop'
+
+$azContext = Get-AzContext -ErrorAction 'Stop'
+
 write-host "Starting script at $(Get-Date)"
 
-Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-Install-Module -Name Az.Synapse -Force
+Import-Module ../dp500.psm1 -Force
 
-# Handle cases where the user has multiple subscriptions
-$subs = Get-AzSubscription | Select-Object
-if($subs.GetType().IsArray -and $subs.length -gt 1){
-    Write-Host "You have multiple Azure subscriptions - please select the one you want to use:"
-    for($i = 0; $i -lt $subs.length; $i++)
-    {
-            Write-Host "[$($i)]: $($subs[$i].Name) (ID = $($subs[$i].Id))"
-    }
-    $selectedIndex = -1
-    $selectedValidIndex = 0
-    while ($selectedValidIndex -ne 1)
-    {
-            $enteredValue = Read-Host("Enter 0 to $($subs.Length - 1)")
-            if (-not ([string]::IsNullOrEmpty($enteredValue)))
-            {
-                if ([int]$enteredValue -in (0..$($subs.Length - 1)))
-                {
-                    $selectedIndex = [int]$enteredValue
-                    $selectedValidIndex = 1
-                }
-                else
-                {
-                    Write-Output "Please enter a valid subscription number."
-                }
-            }
-            else
-            {
-                Write-Output "Please enter a valid subscription number."
-            }
-    }
-    $selectedSub = $subs[$selectedIndex].Id
-    Select-AzSubscription -SubscriptionId $selectedSub
-    az account set --subscription $selectedSub
+$subscription = Get-AzSubscription -SubscriptionId $SubscriptionId
+if ($null -eq $subscription) {
+    throw "Error setting Azure context. Subscription not found."
 }
 
-# Prompt user for a password for the SQL Database
+$azContext = Set-AzContext -TenantId $subscription.TenantId -SubscriptionId $subscription.Id
+
+$resourceGroup = Get-AzResourceGroup -ResourceGroupName $ResourceGroupName
+if ($null -eq $resourceGroup) {
+    throw "Resource group not found in subscription $($subscription.Name)"
+}
+
 $sqlUser = "SQLUser"
-write-host ""
-$sqlPassword = ""
-$complexPassword = 0
-
-while ($complexPassword -ne 1)
-{
-    $SqlPassword = Read-Host "Enter a password to use for the $sqlUser login.
-    `The password must meet complexity requirements:
-    ` - Minimum 8 characters. 
-    ` - At least one upper case English letter [A-Z]
-    ` - At least one lower case English letter [a-z]
-    ` - At least one digit [0-9]
-    ` - At least one special character (!,@,#,%,^,&,$)
-    ` "
-
-    if(($SqlPassword -cmatch '[a-z]') -and ($SqlPassword -cmatch '[A-Z]') -and ($SqlPassword -match '\d') -and ($SqlPassword.length -ge 8) -and ($SqlPassword -match '!|@|#|%|^|&|$'))
-    {
-        $complexPassword = 1
-	    Write-Output "Password $SqlPassword accepted. Make sure you remember this!"
-    }
-    else
-    {
-        Write-Output "$SqlPassword does not meet the compexity requirements."
-    }
-}
-
-# Register resource providers
-Write-Host "Registering resource providers...";
-$provider_list = "Microsoft.Synapse", "Microsoft.Sql", "Microsoft.Storage", "Microsoft.Compute"
-foreach ($provider in $provider_list){
-    $result = Register-AzResourceProvider -ProviderNamespace $provider
-    while ($result.RegistrationState -eq "Registering") {
-        
-        Start-Sleep -Seconds 3
-        $result = Register-AzResourceProvider -ProviderNamespace $provider
-    }
-    Write-Host "$provider registered"
-}
-
-# Generate unique random suffix
-[string]$suffix =  -join ((48..57) + (97..122) | Get-Random -Count 7 | % {[char]$_})
-Write-Host "Your randomly-generated suffix for Azure resources is $suffix"
-$resourceGroupName = "dp500-$suffix"
 
 # Choose a random region
 Write-Host "Finding an available region. This may take several minutes...";
-$delay = 0, 30, 60, 90, 120 | Get-Random
-Start-Sleep -Seconds $delay # random delay to stagger requests from multi-student classes
-$preferred_list = "australiaeast","centralus","southcentralus","eastus2","northeurope","southeastasia","uksouth","westeurope","westus","westus2"
-$locations = Get-AzLocation | Where-Object {
-    $_.Providers -contains "Microsoft.Synapse" -and
-    $_.Providers -contains "Microsoft.Sql" -and
-    $_.Providers -contains "Microsoft.Storage" -and
-    $_.Providers -contains "Microsoft.Compute" -and
-    $_.Location -in $preferred_list
-}
-$max_index = $locations.Count - 1
-$rand = (0..$max_index) | Get-Random
-$Region = $locations.Get($rand).Location
 
-# Test for subscription Azure SQL capacity constraints in randomly selected regions
-# (for some subsription types, quotas are adjusted dynamically based on capacity)
- $success = 0
- $tried_list = New-Object Collections.Generic.List[string]
+$preferredLocations = "australiaeast","centralus","southcentralus","eastus2","northeurope","southeastasia","uksouth","westeurope","westus","westus2"
+$requiredResourceProviders = "Microsoft.Synapse","Microsoft.Sql","Microsoft.Storage","Microsoft.Compute"
 
- while ($success -ne 1){
-    write-host "Trying $Region"
-    $capability = Get-AzSqlCapability -LocationName $Region
-    if($capability.Status -eq "Available")
-    {
-        $success = 1
-        write-host "Using $Region"
-    }
-    else
-    {
-        $success = 0
-        $tried_list.Add($Region)
-        $locations = $locations | Where-Object {$_.Location -notin $tried_list}
-        if ($locations.length -gt 0)
-        {
-            $rand = (0..$($locations.Count - 1)) | Get-Random
-            $Region = $locations.Get($rand).Location
-        }
-        else {
-            Write-Host "Couldn't find an available region for deployment."
-            Write-Host "Sorry! Try again later."
-            Exit
-        }
-    }
-}
-Write-Host "Creating $resourceGroupName resource group in $Region ..."
-New-AzResourceGroup -Name $resourceGroupName -Location $Region | Out-Null
+# Fetch locations with matching resource providers from our list of preferred locations
+$locations = Get-GdAzLocationSupportingResource -RequiredResourceProvider $requiredResourceProviders -PreferredLocation $preferredLocations
+Write-Host "$($locations.count)/$($preferredLocations.count) support the required resources."
+
+# Randomise the list
+$locations = $locations | Sort-Object {Get-Random}
+
+# Get the first location with availability for SQL
+$location = Get-GdAzLocationWithSqlAvailability -Locations $locations
+Write-Host "Selected location $($location.Location)"
+
+# Generate unique random suffix
+$suffix = New-GdRandomString -Length 7
+Write-Host "Your randomly-generated suffix for Azure resources is $suffix"
 
 # Create Synapse workspace
 $synapseWorkspace = "synapse$suffix"
@@ -152,11 +71,10 @@ New-AzResourceGroupDeployment -ResourceGroupName $resourceGroupName `
 # Make the current user and the Synapse service principal owners of the data lake blob store
 write-host "Granting permissions on the $dataLakeAccountName storage account..."
 write-host "(you can ignore any warnings!)"
-$subscriptionId = (Get-AzContext).Subscription.Id
-$userName = ((az ad signed-in-user show) | ConvertFrom-JSON).UserPrincipalName
+$userName = $azContext.Account.Id
 $id = (Get-AzADServicePrincipal -DisplayName $synapseWorkspace).id
-New-AzRoleAssignment -Objectid $id -RoleDefinitionName "Storage Blob Data Owner" -Scope "/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.Storage/storageAccounts/$dataLakeAccountName" -ErrorAction SilentlyContinue;
-New-AzRoleAssignment -SignInName $userName -RoleDefinitionName "Storage Blob Data Owner" -Scope "/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.Storage/storageAccounts/$dataLakeAccountName" -ErrorAction SilentlyContinue;
+New-AzRoleAssignment -Objectid $id -RoleDefinitionName "Storage Blob Data Owner" -Scope "/subscriptions/$SubscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.Storage/storageAccounts/$dataLakeAccountName" -ErrorAction SilentlyContinue;
+New-AzRoleAssignment -SignInName $userName -RoleDefinitionName "Storage Blob Data Owner" -Scope "/subscriptions/$SubscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.Storage/storageAccounts/$dataLakeAccountName" -ErrorAction SilentlyContinue;
 
 # Upload files
 write-host "Loading data..."

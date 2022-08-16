@@ -1,30 +1,37 @@
-Clear-Host
-Write-Host "Starting setup script at $(Get-Date)"
+param(
+    [Parameter(Mandatory=$true)]
+    [string]
+    $SubscriptionId,
+    [Parameter(Mandatory=$true)]
+    [string]
+    $ResourceGroupName,
+    [Parameter(Mandatory=$true)]
+    [string]
+    $SqlPassword
+)
+
 $ErrorActionPreference = 'Stop'
 
-#Installing required packages
+$azContext = Get-AzContext -ErrorAction 'Stop'
 
-[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
-Register-PSRepository -Default -Verbose -ErrorAction 'SilentlyContinue'
-Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction 'SilentlyContinue'
-Install-Module -Name Az.Sql -Force -Verbose:$false -WarningAction 'SilentlyContinue'
-Install-Module -Name Az.Storage -Force -Verbose:$false -WarningAction 'SilentlyContinue'
-Install-Module -Name Az.Resources -Force -Verbose:$false -WarningAction 'SilentlyContinue'
+write-host "Starting script at $(Get-Date)"
 
-#Creating required variables
+$subscription = Get-AzSubscription -SubscriptionId $SubscriptionId
+if ($null -eq $subscription) {
+    throw "Error setting Azure context. Subscription not found."
+}
 
-$AzureUsername = Read-Host -Prompt "Enter your Azure account name"
-$AzurePassword = Read-Host -Prompt "Enter your Azure account password" -AsSecureString 
-$ResourceGroupName = Read-Host -Prompt "Enter your resource group name" 
+$azContext = Set-AzContext -TenantId $subscription.TenantId -SubscriptionId $subscription.Id
 
-$AzCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList ($AzureUsername, $AzurePassword)
-Connect-AzAccount -Credential $AzCredential
+$resourceGroup = Get-AzResourceGroup -ResourceGroupName $ResourceGroupName
+if ($null -eq $resourceGroup) {
+    throw "Resource group not found in subscription $($subscription.Name)"
+}
 
-$Location = Get-AzResourceGroup -Name $ResourceGroupName | Select-Object -ExpandProperty location
+$location = $resourceGroup.Location
+
 $storageName = ('dp500sa' + (Get-Random -Minimum 0 -Maximum 999999 ).ToString('000000')).ToLower()
 $ServerName = ('dp500server-' + (Get-Random -Minimum 0 -Maximum 999999 ).ToString('000000')).ToLower()
-$FolderName = "D:\DP500"
 
 #Create storage accountadmin
 
@@ -47,8 +54,10 @@ New-AzStorageContainer -Name $ContainerName -Context $Context -Permission Blob
 
 Start-Sleep -s 5
 
+$bacpakPath = Join-Path (Resolve-Path '../') '00-Setup\DatabaseBackup\AdventureWorksDW2022-DP500.bacpac'
+
 $Blob1HT = @{  
-    File             = "$($FolderName)\Allfiles\00-Setup\DatabaseBackup\AdventureWorksDW2022-DP500.bacpac"          
+    File             = $bacpakPath
     Container        = $ContainerName  
     Blob             = "AdventureWorksDW2022-DP500.bacpac"  
     Context          = $Context  
@@ -59,8 +68,8 @@ Set-AzStorageBlobContent @Blob1HT
 
 #Create SQL Database server
 
-$SQLPassword = ConvertTo-SecureString -String 'P@ssw0rd01' -AsPlainText -Force
-$SQLCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList 'sqladmin',$SQLPassword 
+$sqlSecurePassword = ConvertTo-SecureString -String $SqlPassword -AsPlainText -Force
+$SQLCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList 'sqladmin',$sqlSecurePassword
 
 New-AzSqlServer -ServerName $ServerName -ResourceGroupName $ResourceGroupName -Location $Location -SqlAdministratorCredentials $SQLCredential
 Start-Sleep -s 5
@@ -70,7 +79,7 @@ Start-Sleep -s 5
 
 #Import .bacpac file
 
-New-AzSqlDatabaseImport -ResourceGroupName $ResourceGroupName -ServerName $ServerName -DatabaseName "AdventureWorksDW2022-DP500" -DatabaseMaxSizeBytes 5368709120  -StorageKeyType "StorageAccessKey" -StorageKey $(Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -StorageAccountName $storageName).Value[0] -StorageUri "https://$($storageName).blob.core.windows.net/dp500/AdventureWorksDW2022-DP500.bacpac" -Edition "Standard" -ServiceObjectiveName "S2" -AdministratorLogin "sqladmin" -AdministratorLoginPassword $(ConvertTo-SecureString -String 'P@ssw0rd01' -AsPlainText -Force)
+New-AzSqlDatabaseImport -ResourceGroupName $ResourceGroupName -ServerName $ServerName -DatabaseName "AdventureWorksDW2022-DP500" -DatabaseMaxSizeBytes 5368709120  -StorageKeyType "StorageAccessKey" -StorageKey $(Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -StorageAccountName $storageName).Value[0] -StorageUri "https://$($storageName).blob.core.windows.net/dp500/AdventureWorksDW2022-DP500.bacpac" -Edition "Standard" -ServiceObjectiveName "S2" -AdministratorLogin "sqladmin" -AdministratorLoginPassword $sqlSecurePassword
 
 Start-Sleep -s 300
 

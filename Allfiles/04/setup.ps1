@@ -1,112 +1,83 @@
-cls
+param(
+    [Parameter(Mandatory=$true)]
+    [string]
+    $SubscriptionId,
+    [Parameter(Mandatory=$true)]
+    [string]
+    $ResourceGroupName,
+    [Parameter(Mandatory=$true)]
+    [string]
+    $SqlPassword
+)
+
+$ErrorActionPreference = 'Stop'
+
 write-host "Starting script at $(Get-Date)"
 
-Install-Module -Name Az.Synapse
+$azContext = Get-AzContext -ErrorAction 'Stop'
+
+Import-Module ../dp500.psm1 -Force
+
+$subscription = Get-AzSubscription -SubscriptionId $SubscriptionId
+if ($null -eq $subscription) {
+    throw "Error setting Azure context. Subscription not found."
+}
+
+$azContext = Set-AzContext -TenantId $subscription.TenantId -SubscriptionId $subscription.Id
+
+$resourceGroup = Get-AzResourceGroup -ResourceGroupName $ResourceGroupName
+if ($null -eq $resourceGroup) {
+    throw "Resource group not found in subscription $($subscription.Name)"
+}
+
+# Choose a random region
+Write-Host "Finding an available region. This may take several minutes...";
+
+$preferredLocations = "australiaeast","centralus","southcentralus","eastus2","northeurope","southeastasia","uksouth","westeurope","westus","westus2"
+$requiredResourceProviders = "Microsoft.Synapse","Microsoft.Sql","Microsoft.Storage","Microsoft.Compute"
+
+# Fetch locations with matching resource providers from our list of preferred locations
+$locations = Get-GdAzLocationSupportingResource -RequiredResourceProvider $requiredResourceProviders -PreferredLocation $preferredLocations
+Write-Host "$($locations.count)/$($preferredLocations.count) support the required resources."
+
+# Randomise the list
+$locations = $locations | Sort-Object {Get-Random}
+
+# Get the first location with availability for SQL
+$location = Get-GdAzLocationWithSqlAvailability -Locations $locations
+Write-Host "Selected location $($location.Location)"
+
+# Generate unique random suffix
+$suffix = New-GdRandomString -Length 7
 
 $sqlDatabaseName = "sqldw"
 $sqlUser = "SQLUser"
 
-# Prompt user for a password for the SQL Database
-write-host ""
-$sqlPassword = ""
-$complexPassword = 0
-
-while ($complexPassword -ne 1)
-{
-    $SqlPassword = Read-Host "Enter a password to use for the $sqlUser login.
-    `The password must meet complexity requirements:
-    ` - Minimum 8 characters. 
-    ` - At least one upper case English letter [A-Z]
-    ` - At least one lower case English letter [a-z]
-    ` - At least one digit [0-9]
-    ` - At least one special character (!,@,#,%,^,&,$)
-    ` "
-
-    if(($SqlPassword -cmatch '[a-z]') -and ($SqlPassword -cmatch '[A-Z]') -and ($SqlPassword -match '\d') -and ($SqlPassword.length -ge 8) -and ($SqlPassword -match '!|@|#|%|^|&|$'))
-    {
-        $complexPassword = 1
-	  Write-Output "Password $SqlPassword accepted. Make sure you remember this!"
-    }
-    else
-    {
-        Write-Output "$SqlPassword does not meet the complexity requirements."
-    }
-}
-
-# Register resource providers
-Write-Host "Registering resource providers...";
-$provider_list = "Microsoft.Synapse", "Microsoft.Sql", "Microsoft.Storage", "Microsoft.Compute"
-foreach ($provider in $provider_list){
-    $result = Register-AzResourceProvider -ProviderNamespace $provider
-    while ($result.RegistrationState -eq "Registering") {
-        
-        Start-Sleep -Seconds 3
-        $result = Register-AzResourceProvider -ProviderNamespace $provider
-    }
-    Write-Host "$provider registered"
-}
-
-# Generate unique random suffix
-[string]$suffix =  -join ((48..57) + (97..122) | Get-Random -Count 7 | % {[char]$_})
-Write-Host "Your randomly-generated suffix for Azure resources is $suffix"
-$resourceGroupName = "dp500-$suffix"
-
-# Choose a random region
-Write-Host "Finding an available region. This may take several minutes...";
-$preferred_list = "australiaeast","centralus","southcentralus","eastus2","northeurope","southeastasia","uksouth","westeurope","westus","westus2"
-$locations = Get-AzLocation | Where-Object {
-    $_.Providers -contains "Microsoft.Synapse" -and
-    $_.Providers -contains "Microsoft.Sql" -and
-    $_.Providers -contains "Microsoft.Storage" -and
-    $_.Providers -contains "Microsoft.Compute" -and
-    $_.Location -in $preferred_list
-}
-$max_index = $locations.Count - 1
-$rand = (0..$max_index) | Get-Random
-$Region = $locations.Get($rand).Location
-
-# Test for subscription Azure SQL capacity constraints in randomly selected regions
-# (for some subsription types, quotas are adjusted dynamically based on capacity)
- $success = 0
- $tried_list = New-Object Collections.Generic.List[string]
-
- while ($success -ne 1){
-    write-host "Trying $Region"
-    $capability = Get-AzSqlCapability -LocationName $Region
-    if($capability.Status -eq "Available")
-    {
-        $success = 1
-        write-host "Using $Region"
-    }
-    else
-    {
-        $success = 0
-        $tried_list.Add($Region)
-        $locations = $locations | Where-Object {$_.Location -notin $tried_list}
-        $rand = (0..$($locations.Count - 1)) | Get-Random
-        $Region = $locations.Get($rand).Location
-    }
-}
-Write-Host "Creating $resourceGroupName resource group in $Region ..."
-New-AzResourceGroup -Name $resourceGroupName -Location $Region | Out-Null
-
 # Create Synapse workspace
 $synapseWorkspace = "synapsews$suffix"
 
-write-host "Creating $synapseWorkspace Synapse Analytics workspace in $resourceGroupName resource group..."
-New-AzResourceGroupDeployment -ResourceGroupName $resourceGroupName `
+write-host "Creating $synapseWorkspace Synapse Analytics workspace in $ResourceGroupName resource group..."
+New-AzResourceGroupDeployment -ResourceGroupName $ResourceGroupName `
   -TemplateFile "setup.json" `
   -Mode Complete `
   -workspaceName $synapseWorkspace `
   -uniqueSuffix $suffix `
   -sqlDatabaseName $sqlDatabaseName `
   -sqlUser $sqlUser `
-  -sqlPassword $sqlPassword `
+  -sqlPassword $SqlPassword `
   -Force
+
+# Make the current user and the Synapse service principal owners of the data lake blob store
+write-host "Granting permissions on the $dataLakeAccountName storage account..."
+write-host "(you can ignore any warnings!)"
+$username = $azContext.Account.Id
+$id = (Get-AzADServicePrincipal -DisplayName $synapseWorkspace).id
+New-AzRoleAssignment -Objectid $id -RoleDefinitionName "Storage Blob Data Owner" -Scope "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Storage/storageAccounts/$dataLakeAccountName" -ErrorAction SilentlyContinue;
+New-AzRoleAssignment -SignInName $userName -RoleDefinitionName "Storage Blob Data Owner" -Scope "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Storage/storageAccounts/$dataLakeAccountName" -ErrorAction SilentlyContinue;
 
 # Create database
 write-host "Creating the $sqlDatabaseName database..."
-sqlcmd -S "$synapseWorkspace.sql.azuresynapse.net" -U $sqlUser -P $sqlPassword -d $sqlDatabaseName -I -i setup.sql
+sqlcmd -S "$synapseWorkspace.sql.azuresynapse.net" -U $sqlUser -P $SqlPassword -d $sqlDatabaseName -I -i setup.sql
 
 # Load data
 write-host "Loading data..."
@@ -115,7 +86,7 @@ Get-ChildItem "./data/*.txt" -File | Foreach-Object {
     $file = $_.FullName
     Write-Host "$file"
     $table = $_.Name.Replace(".txt","")
-    bcp dbo.$table in $file -S "$synapseWorkspace.sql.azuresynapse.net" -U $sqlUser -P $sqlPassword -d $sqlDatabaseName -f $file.Replace("txt", "fmt") -q -k -E -b 5000
+    bcp dbo.$table in $file -S "$synapseWorkspace.sql.azuresynapse.net" -U $sqlUser -P $SqlPassword -d $sqlDatabaseName -f $file.Replace("txt", "fmt") -q -k -E -b 5000
 }
 
 # Pause SQL Pool
